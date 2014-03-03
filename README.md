@@ -1,5 +1,12 @@
 Heavily inspired by flynn/slugbuilder, ddollar/mason and phusion/baseimage-docker
 
+## What is a slug ?
+
+Slugs are compressed and pre-packaged copies of your application optimized for distribution to the Heroku dyno manager. 
+When you git push to Heroku, your code is received by the slug compiler which transforms your repository into a slug. 
+Scaling an application then downloads and expands the slug to a dyno for execution. - from Heroku docs
+
+
 ## Extra Features
 - Extra environment variables
 - slug compilation and compression
