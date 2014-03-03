@@ -1,0 +1,268 @@
+#!/usr/bin/env ruby
+require 'faraday'
+require 'tmpdir'
+require 'yaml'
+require 'securerandom'
+require 'shellwords'
+
+class Builder
+  def initialize(slug_file, upload_url = '', report_url = '')
+    @app_dir = '/app'
+    @cache_dir = '/tmp/cache'
+    @buildpack_root = '/slugbuilder/buildpacks'
+    @slug_file = '/tmp/.slugbuilder.tgz'
+    @slug_out = Shellwords.escape(slug_file)
+    @upload_url = upload_url
+    @report_url = report_url
+    @extra_env = {}
+    @request_id = SecureRandom.hex
+  end
+
+  def create_dirs
+    @build_dir = Dir.mktmpdir
+    FileUtils.mkdir(File.join(@build_dir, '.profile.d'))
+
+    FileUtils.mkdir_p(@app_dir)
+  end
+
+  def environment
+    # system
+
+    load_env_file("#{@cache_dir}/env")
+    load_env_file("#{@build_dir}/.env")
+
+    # make sure ours go on top
+    ENV['HOME'] = @app_dir
+    ENV['APP_DIR'] = @app_dir
+    ENV['REQUEST_ID'] = @request_id
+    # so applications can tell if they are building or running
+    ENV['SLUG_ENV'] = '1'
+
+    # this gets set on slugbuild, SLUGRUNNER gets set as we run the slug
+    ENV['SLUGBUILDER'] = '1'
+
+    stitle("Build environment")
+    ENV.each do |k,v|
+      stext("#{k}=#{v}")
+    end
+  end
+
+  def stitle(line)
+    STDERR.puts("-----> #{line}")
+  end
+
+  def stext(line)
+    STDERR.puts("       #{line}")
+  end
+
+  def copy_app
+    rc = run("tar -xC #{@app_dir}")
+    fail "Failed to load application" if rc != 0
+
+    FileUtils.cp_r("#{@app_dir}/.", @build_dir, preserve: true)
+  end
+
+  def select_buildpack
+    buildpack = nil
+
+    if @extra_env.key?('BUILDPACK_URL')
+      stitle("Fetching custom buildpack")
+      rc = run("git clone --depth=1 #{Shellwords.escape(@extra_env['BUILDPACK_URL'])} #{@buildpack_root}/00-custom")
+      fail "Failed to download custom buildpack: #{@extra_env['BUILDPACK_URL']}" if rc != 0
+    end
+
+    Dir["#{@buildpack_root}/**"].each do |file|
+      if run("#{file}/bin/detect #{@build_dir}") == 0
+        buildpack = file
+        break
+      end
+    end
+    fail "Could not detect buildpack" unless buildpack
+
+    @buildpack = buildpack
+  end
+
+  def compile
+    rc = run_echo("#{@buildpack}/bin/compile '#{@build_dir}' '#{@cache_dir}'")
+    fail "Couldn't compile application using buildpack #{@buildpack}" if rc != 0
+  end
+
+  def release
+    # should create .release
+    release_file = File.open("#{@build_dir}/.release", "w")
+    rc = run("#{@buildpack}/bin/release '#{@build_dir}' '#{@cache_dir}'") do |line|
+      release_file.print(line)
+    end
+    release_file.close
+
+    fail "Couldn't compile application using buildpack #{@buildpack}" if rc != 0
+  end
+
+  def profile_extras
+    File.open("#{@build_dir}/.profile.d/99extra.sh", "w") do |file|
+      @extra_env.each do |k,v|
+        file.puts("export #{Shellwords.escape(k)}=#{Shellwords.escape(v)}")
+      end
+    end
+  end
+
+  def slugit
+    rc = 1
+    if File.exists?("#{@build_dir}/.slugignore")
+      rc = run_echo("tar --exclude='.git' --use-compress-program=pigz -X #{@build_dir}/.slugignore -C #{@build_dir} -cf #{@slug_file} .")
+    else
+      rc = run_echo("tar --exclude='.git' --use-compress-program=pigz -C #{@build_dir} -cf #{@slug_file} .")
+    end
+    fail "Couldn't create slugfile" if rc != 0
+  end
+
+  def dump_slug
+    File.open(@slug_file, "r") do |file|
+        print(file.read(1024)) until file.eof?
+    end
+  end
+
+  def upload_slug
+    stitle("Uploading slug to #{@upload_url}")
+
+    conn = Faraday.new do |f|
+      f.request :multipart
+      f.adapter :em_http
+    end
+
+    response = conn.put(@upload_url, Faraday::UploadIO.new(@slug_file, 'application/x-gzip'))
+    fail unless response.status.between?(200, 300)
+  end
+
+  def slug_size
+    @slug_size = File.size(@slug_file) / 1024 / 1024
+    stitle("Slug size is #{@slug_size} Megabytes.")
+  end
+
+  def print_workers
+    workers = {}
+    if File.exists?("#{@build_dir}/Procfile")
+      procfile = YAML.load_file("#{@build_dir}/Procfile")
+      workers.merge!(procfile)
+    end
+
+    if File.exists?("#{@build_dir}/.release")
+      procfile = YAML.load_file("#{@build_dir}/.release")
+      workers.merge!(procfile['default_process_types']) if procfile.key?('default_process_types')
+    end
+
+    stitle("Process Types: #{workers.keys.join(', ')}")
+  end
+
+  def build_and_release
+    @overall_time = realtime do
+      create_dirs
+      stext("Saving application to #{@build_dir}")
+      copy_app
+      environment
+      select_buildpack
+      @compile_time = realtime { compile }
+      release
+      profile_extras
+      @slug_time = realtime { slugit }
+      slug_size
+      print_workers
+      dump_slug if @slug_out == '-'
+      @upload_time = realtime { upload_slug if @upload_url != '' }
+    end
+  end
+
+  def build
+    status = { request_id: @request_id }
+
+    build_and_release
+    stitle("Process completed in #{@overall_time} seconds")
+    stext("Application compiled in #{@compile_time} seconds")
+    stext("Slug compressed in #{@slug_time} seconds")
+    stext("Uploaded slug in #{@upload_time} seconds")
+
+    status[:status] = 'ok'
+    status[:upload_time] = @upload_time
+    status[:slug_time] = @slug_time
+    status[:compile_time] = @compile_time
+    status[:overall_time] = @overall_time
+    status[:slug_size] = @slug_size
+
+    report(status) if @report_url != ''
+    return true
+
+  rescue => e
+    stitle("Failed to create slug: #{e}")
+
+    status[:status] = 'fail'
+    status[:fail_message] = e
+    report(status) if @report_url != ''
+
+    return false
+  end
+
+
+
+
+  private
+
+  def report(status)
+    response = Faraday.post(@report_url, status)
+    fail "Failed to report status to #{@report_url}" unless response.status.between?(200, 300)
+  end
+
+  def realtime
+    t0 = Time.now
+    yield
+    ((Time.now - t0).to_i * 100) / 100.0
+  end
+
+  def run(cmd)
+    STDERR.puts(cmd) if ENV.key?('SLUGBUILDER_DEBUG')
+    IO.popen(cmd) do |io|
+      until io.eof?
+        data = io.gets
+        yield data if block_given?
+      end
+    end
+    $?
+  end
+
+  def run_echo(cmd)
+    run(cmd) do |line|
+      STDERR.print(line)
+    end
+  end
+
+  def load_env_file(file)
+    if File.exists?(file)
+      new_envs = IO.readlines(file)
+      new_envs.each do |line|
+        line.strip!
+        next if line.match(/^#/)
+
+        parts = line.split(/=/, 2)
+        next if parts.length != 2
+
+        ENV[parts[0]] = parts[1]
+        @extra_env[parts[0]] = parts[1]
+      end
+    end
+  end
+
+end
+
+
+
+STDOUT.sync = true
+STDERR.sync = true
+
+slug_out = '-'
+upload_url = ''
+report_url = ''
+
+slug_out = ARGV[0] if ARGV.length > 0
+upload_url = ARGV[1] if ARGV.length > 1
+report_url = ARGV[2] if ARGV.length > 2
+
+exit(1) unless Builder.new(slug_out, upload_url, report_url).build
