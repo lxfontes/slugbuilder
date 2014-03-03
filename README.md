@@ -1,6 +1,7 @@
 Heavily inspired by flynn/slugbuilder, ddollar/mason and phusion/baseimage-docker
 
 ## Extra Features
+- Extra environment variables
 - slug compilation and compression
 - slug upload
 - Ping notifications with: slug size, errors, compile time
@@ -48,6 +49,16 @@ Saving slug locally and reporting:
 To speed up slug building, it's best to mount a volume specific to your app at `/tmp/cache`. For example, if you wanted to keep the cache for this app on your host at `/tmp/app-cache`, you'd mount a read-write volume by running docker with this added `-v /tmp/app-cache:/tmp/cache:rw` option:
 
     docker run -v /tmp/app-cache:/tmp/cache:rw -i -a stdin -a stdout lxfontes/slugbuilder
+
+## Environment
+
+Environment variables defined are parsed from 3 locations:
+
+1. buildpack specific
+2. `.env` file on git repo
+3. `/tmp/cache/env` - which is usually mapped to a long-term storage on the docker host
+
+These will be combined and appended to `.profile.d/99-extra.sh` and made available to application runtime.
 
 ## Buildpacks
 
