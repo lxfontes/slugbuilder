@@ -1,4 +1,5 @@
 #!/usr/bin/env ruby
+# coding: utf-8
 require 'faraday'
 require 'tmpdir'
 require 'yaml'
@@ -225,7 +226,7 @@ class Builder
         yield data if block_given?
       end
     end
-    $?
+    $?.exitstatus
   end
 
   def run_echo(cmd)
@@ -249,10 +250,7 @@ class Builder
       end
     end
   end
-
 end
-
-
 
 STDOUT.sync = true
 STDERR.sync = true
