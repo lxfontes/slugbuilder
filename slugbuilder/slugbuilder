@@ -100,7 +100,7 @@ class Builder
   end
 
   def profile_extras
-    File.open("#{@build_dir}/.profile.d/99extra.sh", "w") do |file|
+    File.open("#{@build_dir}/.profile.d/98extra.sh", "w") do |file|
       @extra_env.each do |k,v|
         file.puts("export #{Shellwords.escape(k)}=#{Shellwords.escape(v)}")
       end
